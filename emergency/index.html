@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Emergency File</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 780px; margin: 40px auto; padding: 0 16px; }
+    textarea { width: 100%; height: 260px; font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+    input { width: 100%; padding: 10px; font-size: 16px; }
+    button { padding: 10px 14px; font-size: 16px; cursor: pointer; }
+    .row { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
+    .row > * { flex: 1; }
+    .muted { color:#666; font-size: 14px; }
+    .err { color: #b00020; }
+    .ok { color: #0a7a0a; }
+    code { background: #f4f4f4; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Emergency File</h1>
+  <p class="muted">
+    This page decrypts <code>emergency.enc.json</code> locally in your browser after you enter the passphrase.
+    If you forget the passphrase, there is no recovery.
+  </p>
+
+  <label for="pw">Passphrase</label>
+  <input id="pw" type="password" autocomplete="current-password" />
+  <div class="row">
+    <button id="decrypt">Decrypt</button>
+    <button id="clear" type="button">Clear</button>
+  </div>
+  <p id="status" class="muted"></p>
+
+  <h2>Decrypted content</h2>
+  <textarea id="out" readonly placeholder="(Nothing decrypted yet)"></textarea>
+
+<script>
+(async () => {
+  const status = document.getElementById('status');
+  const out = document.getElementById('out');
+  const pw = document.getElementById('pw');
+
+  const textEncoder = new TextEncoder();
+  const textDecoder = new TextDecoder();
+
+  function setStatus(msg, cls="muted") {
+    status.className = cls;
+    status.textContent = msg;
+  }
+
+  // OpenSSL "enc" format (aes-256-cbc -salt -pbkdf2) uses:
+  // header: "Salted__" + 8-byte salt, then ciphertext
+  // Key+IV derived via PBKDF2-HMAC-SHA256 in OpenSSL when -pbkdf2 is used.
+  async function deriveKeyAndIV(passphrase, salt) {
+    // OpenSSL default iterations for -pbkdf2 is 10000 historically; newer builds may differ.
+    // To keep this robust, we store the iteration count in future if you want; for now assume 10000.
+    const iterations = 10000;
+
+    const baseKey = await crypto.subtle.importKey(
+      "raw",
+      textEncoder.encode(passphrase),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+
+    // Need 32 bytes key + 16 bytes IV = 48 bytes
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", salt, iterations, hash: "SHA-256" },
+      baseKey,
+      48 * 8
+    );
+    const bytes = new Uint8Array(bits);
+    const keyBytes = bytes.slice(0, 32);
+    const iv = bytes.slice(32, 48);
+
+    const key = await crypto.subtle.importKey(
+      "raw",
+      keyBytes,
+      { name: "AES-CBC" },
+      false,
+      ["decrypt"]
+    );
+
+    return { key, iv };
+  }
+
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  async function fetchEncrypted() {
+    const resp = await fetch("./emergency.enc.json", { cache: "no-store" });
+    if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+    const data = await resp.json();
+    if (!data.b64) throw new Error("Missing b64");
+    return b64ToBytes(data.b64);
+  }
+
+  async function decryptOpenSSLEnc(bytes, passphrase) {
+    const header = textDecoder.decode(bytes.slice(0, 8));
+    if (header !== "Salted__") throw new Error("Not OpenSSL salted format");
+    const salt = bytes.slice(8, 16);
+    const ciphertext = bytes.slice(16);
+
+    const { key, iv } = await deriveKeyAndIV(passphrase, salt);
+
+    const plainBuf = await crypto.subtle.decrypt(
+      { name: "AES-CBC", iv },
+      key,
+      ciphertext
+    );
+
+    return textDecoder.decode(plainBuf);
+  }
+
+  document.getElementById('decrypt').addEventListener('click', async () => {
+    out.value = "";
+    setStatus("Fetching encrypted file…");
+    try {
+      const enc = await fetchEncrypted();
+      setStatus("Decrypting locally…");
+      const plaintext = await decryptOpenSSLEnc(enc, pw.value);
+      out.value = plaintext.replace(/\u0000+$/g, ""); // trim null padding artifacts
+      setStatus("Decrypted.", "ok");
+    } catch (e) {
+      setStatus("Decrypt failed. Wrong passphrase or file/format mismatch.", "err");
+      console.error(e);
+    }
+  });
+
+  document.getElementById('clear').addEventListener('click', () => {
+    pw.value = "";
+    out.value = "";
+    setStatus("Cleared.");
+  });
+})();
+</script>
+</body>
+</html>
